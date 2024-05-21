@@ -1,0 +1,185 @@
+---
+- name: Install Apache Guacamole on Debian
+  hosts: all
+  become: yes
+
+  vars:
+    guacamole_version: "1.5.5"
+    mysql_connector_version: "8.4.0"
+    guacamole_db_password: "GuacamolePassword"
+
+  tasks:
+    - name: Update base system
+      apt:
+        update_cache: yes
+        upgrade: dist
+
+    - name: Install required packages
+      apt:
+        name:
+          - openjdk-11-jdk
+          - tomcat9
+          - mariadb-server
+          - nginx
+          - certbot
+          - python3-certbot-nginx
+          - build-essential
+          - libcairo2-dev
+          - libjpeg-turbo8-dev
+          - libpng-dev
+          - libtool
+          - libossp-uuid-dev
+          - freerdp2-dev
+          - libvncserver-dev
+          - libwebp-dev
+          - libpango1.0-dev
+          - libssh2-1-dev
+          - libssl-dev
+          - libvorbis-dev
+        state: present
+
+    - name: Start and enable Tomcat
+      systemd:
+        name: tomcat9
+        state: started
+        enabled: yes
+
+    - name: Start and enable MariaDB
+      systemd:
+        name: mariadb
+        state: started
+        enabled: yes
+
+    - name: Secure MariaDB installation
+      expect:
+        command: mysql_secure_installation
+        responses:
+          "Enter current password for root (enter for none):": ""
+          "Switch to unix_socket authentication": "n"
+          "Set root password?": "y"
+          "New password:": "{{ guacamole_db_password }}"
+          "Re-enter new password:": "{{ guacamole_db_password }}"
+          "Remove anonymous users?": "y"
+          "Disallow root login remotely?": "y"
+          "Remove test database and access to it?": "y"
+          "Reload privilege tables now?": "y"
+
+    - name: Create Guacamole database and user
+      mysql_db:
+        name: guacamoledb
+        state: present
+
+    - name: Create Guacamole MySQL user
+      mysql_user:
+        name: guacamole
+        password: "{{ guacamole_db_password }}"
+        priv: 'guacamoledb.*:ALL'
+        host: localhost
+        state: present
+
+    - name: Configure Firewall
+      firewalld:
+        service: 
+          - http
+          - https
+        permanent: yes
+        state: enabled
+        immediate: yes
+
+    - name: Download and extract Guacamole server
+      command: >
+        wget -q -O - https://dlcdn.apache.org/guacamole/{{ guacamole_version }}/source/guacamole-server-{{ guacamole_version }}.tar.gz |
+        tar -xz
+      args:
+        chdir: /tmp
+
+    - name: Build and install Guacamole server
+      command: ./configure --with-systemd-dir=/etc/systemd/system/
+      args:
+        chdir: /tmp/guacamole-server-{{ guacamole_version }}
+      register: configure_output
+      failed_when: "'error' in configure_output.stdout"
+
+    - name: Make and install Guacamole server
+      command: make && make install
+      args:
+        chdir: /tmp/guacamole-server-{{ guacamole_version }}
+      register: make_output
+      failed_when: "'error' in make_output.stdout"
+
+    - name: Run ldconfig
+      command: ldconfig
+
+    - name: Reload systemd
+      systemd:
+        daemon_reload: yes
+
+    - name: Start and enable Guacamole daemon
+      systemd:
+        name: guacd
+        state: started
+        enabled: yes
+
+    - name: Create directories for Guacamole configuration
+      file:
+        path: "/etc/guacamole/{{ item }}"
+        state: directory
+      loop:
+        - extensions
+        - lib
+
+    - name: Download Guacamole web application
+      get_url:
+        url: "https://dlcdn.apache.org/guacamole/{{ guacamole_version }}/binary/guacamole-{{ guacamole_version }}.war"
+        dest: "/var/lib/tomcat9/webapps/guacamole.war"
+
+    - name: Restart Tomcat
+      systemd:
+        name: tomcat9
+        state: restarted
+
+    - name: Set GUACAMOLE_HOME
+      lineinfile:
+        path: /etc/default/tomcat9
+        line: "GUACAMOLE_HOME=/etc/guacamole"
+        create: yes
+
+    - name: Download and extract JDBC authentication extension
+      command: >
+        wget -q -O - https://downloads.apache.org/guacamole/{{ guacamole_version }}/binary/guacamole-auth-jdbc-{{ guacamole_version }}.tar.gz |
+        tar -xz
+      args:
+        chdir: /tmp
+
+    - name: Move JDBC authentication extension
+      command: mv /tmp/guacamole-auth-jdbc-{{ guacamole_version }}/mysql/guacamole-auth-jdbc-mysql-{{ guacamole_version }}.jar /etc/guacamole/extensions/
+
+    - name: Initialize MySQL schema for Guacamole
+      mysql_db:
+        name: guacamoledb
+        state: import
+        target: "/tmp/guacamole-auth-jdbc-{{ guacamole_version }}/mysql/schema"
+
+    - name: Download and extract MySQL connector
+      command: >
+        wget -q -O - https://dev.mysql.com/get/Downloads/Connector-J/mysql-connector-j-{{ mysql_connector_version }}.tar.gz |
+        tar -xz
+      args:
+        chdir: /tmp
+
+    - name: Move MySQL connector
+      command: mv /tmp/mysql-connector-j-{{ mysql_connector_version }}/mysql-connector-j-{{ mysql_connector_version }}.jar /etc/guacamole/lib/
+
+    - name: Configure Guacamole properties
+      copy:
+        dest: /etc/guacamole/guacamole.properties
+        content: |
+          mysql-hostname: localhost
+          mysql-database: guacamoledb
+          mysql-username: guacamole
+          mysql-password: {{ guacamole_db_password }}
+
+    - name: Restart Tomcat
+      systemd:
+        name: tomcat9
+        state: restarted
